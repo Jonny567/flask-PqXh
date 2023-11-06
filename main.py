@@ -103,7 +103,7 @@ def find_tvs(searchis,attempts=5, first_only=True):
                 attempts -= 1
                 continue
 
-            if re.search(searchis, response):
+            if re.search(r'\b' + re.escape(searchis), response, re.IGNORECASE):
                 if first_only:
                     sock.close()
                     return address[0]
