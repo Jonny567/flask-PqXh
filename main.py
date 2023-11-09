@@ -11,7 +11,25 @@ from key_codes import *
 import socket
 import re
 
+import argparse
+import asyncio
+import logging
+from typing import cast
+
+from pynput import keyboard
+from zeroconf import ServiceStateChange, Zeroconf
+from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
+
+from androidtvremote2 import (
+    AndroidTVRemote,
+    CannotConnect,
+    ConnectionClosed,
+    InvalidAuth,
+)
+
 app = Flask(__name__)
+
+loop = asyncio.get_event_loop()
 
 samsung_arr = []
 samsung_selectedDevice = False
@@ -84,6 +102,142 @@ casper_ip = None
 tclandroid_remote = None
 tclandroid_ip = None
 
+
+
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _bind_keyboard(remote: AndroidTVRemote) -> None:
+    print(
+        "\n\nYou can control the connected Android TV with:"
+        "\n- arrow keys: move selected item"
+        "\n- enter: run selected item"
+        "\n- space: play/pause"
+        "\n- home: go to the home screen"
+        "\n- backspace or esc: go back"
+        "\n- delete: power off/on"
+        "\n- +/-: volume up/down"
+        "\n- 'm': mute"
+        "\n- 'y': YouTube"
+        "\n- 'n': Netflix"
+        "\n- 'd': Disney+"
+        "\n- 'a': Amazon Prime Video"
+        "\n- 'q': quit\n\n"
+    )
+    key_mappings = {
+        keyboard.Key.up: "DPAD_UP",
+        keyboard.Key.down: "DPAD_DOWN",
+        keyboard.Key.left: "DPAD_LEFT",
+        keyboard.Key.right: "DPAD_RIGHT",
+        keyboard.Key.enter: "DPAD_CENTER",
+        keyboard.Key.space: "MEDIA_PLAY_PAUSE",
+        keyboard.Key.home: "HOME",
+        keyboard.Key.backspace: "BACK",
+        keyboard.Key.esc: "BACK",
+        keyboard.Key.delete: "POWER",
+    }
+
+    def transmit_keys() -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+
+        def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, key)
+
+        keyboard.Listener(on_press=on_press).start()
+        return queue
+
+    key_queue = transmit_keys()
+    while True:
+        key = await key_queue.get()
+        if key in key_mappings:
+            remote.send_key_command(key_mappings[key])
+        if hasattr(key, "char"):
+            if key.char == "q":
+                remote.disconnect()
+                return
+            elif key.char == "m":
+                remote.send_key_command("MUTE")
+            elif key.char == "+":
+                remote.send_key_command("VOLUME_UP")
+            elif key.char == "-":
+                remote.send_key_command("VOLUME_DOWN")
+            elif key.char == "y":
+                remote.send_launch_app_command("https://www.youtube.com")
+            elif key.char == "n":
+                remote.send_launch_app_command("https://www.netflix.com/title")
+            elif key.char == "d":
+                remote.send_launch_app_command("https://www.disneyplus.com")
+            elif key.char == "a":
+                remote.send_launch_app_command("https://app.primevideo.com")
+
+
+
+async def _host_from_zeroconf(timeout: float) -> str:
+    def _async_on_service_state_change(
+        zeroconf: Zeroconf,
+        service_type: str,
+        name: str,
+        state_change: ServiceStateChange,
+    ) -> None:
+        if state_change is not ServiceStateChange.Added:
+            return
+        _ = asyncio.ensure_future(
+            async_display_service_info(zeroconf, service_type, name)
+        )
+
+    async def async_display_service_info(
+        zeroconf: Zeroconf, service_type: str, name: str
+    ) -> None:
+        info = AsyncServiceInfo(service_type, name)
+        await info.async_request(zeroconf, 3000)
+        if info:
+            addresses = [
+                "%s:%d" % (addr, cast(int, info.port))
+                for addr in info.parsed_scoped_addresses()
+            ]
+            print("  Name: %s" % name)
+            print("  Addresses: %s" % ", ".join(addresses))
+            if info.properties:
+                print("  Properties:")
+                for key, value in info.properties.items():
+                    print("    %s: %s", key, value)
+            else:
+                print("  No properties")
+        else:
+            print("  No info")
+        print()
+
+    zc = AsyncZeroconf()
+    services = ["_androidtvremote2._tcp.local."]
+    print(
+        f"\nBrowsing {services} service(s) for {timeout} seconds, press Ctrl-C to exit...\n"
+    )
+    browser = AsyncServiceBrowser(
+        zc.zeroconf, services, handlers=[_async_on_service_state_change]
+    )
+    await asyncio.sleep(timeout)
+
+    await browser.async_cancel()
+    return await zc.async_close()
+
+
+async def _pair(remote: AndroidTVRemote,code) -> None:
+    while True:
+        pairing_code = code
+        try:
+            return await remote.async_finish_pairing(pairing_code)
+        except InvalidAuth as exc:
+            _LOGGER.error("Invalid pairing code. Error: %s", exc)
+            continue
+        except ConnectionClosed as exc:
+            _LOGGER.error("Initialize pair again. Error: %s", exc)
+            return await _pair(remote,pairing_code)
+
+
+
 def find_tvs(searchis,attempts=5, first_only=True):
         request = 'M-SEARCH * HTTP/1.1\r\n' \
                   'HOST: 239.255.255.250:1900\r\n' \
@@ -103,7 +257,7 @@ def find_tvs(searchis,attempts=5, first_only=True):
                 attempts -= 1
                 continue
 
-            if re.search(r'\b' + re.escape(searchis), response, re.IGNORECASE):
+            if re.search(searchis, response):
                 if first_only:
                     sock.close()
                     return address[0]
@@ -1189,103 +1343,154 @@ def mibox_button_press():
     return jsonify(response=response_message)
 
 
+
+
 @app.route('/oneplus')
 def oneplus():
     return render_template("oneplus.html")
 
 
+@app.route('/oneplus-send-key', methods=['POST'])
+async def oneplus_press3():
+    global oneplus_remote
+    global oneplus_ip
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", help="IP address of Android TV to connect to")
+    parser.add_argument(
+        "--certfile",
+        help="filename that contains the client certificate in PEM format",
+        default="cert.pem",
+    )
+    parser.add_argument(
+        "--keyfile",
+        help="filename that contains the public key in PEM format",
+        default="key.pem",
+    )
+    parser.add_argument(
+        "--client_name",
+        help="shown on the Android TV during pairing",
+        default="Android TV Remote demo",
+    )
+    parser.add_argument(
+        "--scan_timeout",
+        type=float,
+        help="zeroconf scan timeout in seconds",
+        default=10,
+    )
+    parser.add_argument(
+        "-v", "--verbose", help="enable verbose logging", action="store_true"
+    )
+    args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    host = await _host_from_zeroconf(args.scan_timeout)
+    if(host):
+        oneplus_ip=host
+    else:
+        host=find_tvs("OnePlus")
+        oneplus_ip=host
+
+    oneplus_remote = AndroidTVRemote(args.client_name, args.certfile, args.keyfile, host)
+    if await oneplus_remote.async_generate_cert_if_missing():
+        await oneplus_remote.async_start_pairing()
+    return "oneplus-press3 response"
+
 @app.route('/oneplus-send-ip', methods=['POST'])
-def oneplus_press2():
+async def oneplus_press2():
     global oneplus_remote
     global oneplus_ip
     data = request.get_json()
-    oneplusip = data.get('ip')
-    if(oneplusip=="no"):
-        oneplusip=find_tvs("OnePlus")
-    oneplus_ip=oneplusip
-    pairing_sock = PairingSocket("hmi", oneplusip)
-    pairing_sock.connect()
-    pairing_sock.start_pairing()
-    assert (pairing_sock.connected),"Connection unsuccessful!"
+    code = data.get('ip')
+    await _pair(oneplus_remote, code)
+    while True:
+        try:
+            await oneplus_remote.async_connect()
+            break
+        except InvalidAuth as exc:
+            await _pair(oneplus_remote,code)
+        except (CannotConnect, ConnectionClosed) as exc:
+            _LOGGER.error("Cannot connect, exiting. Error: %s", exc)
+            return "Cannot connect, exiting. Error: " + str(exc)
 
-    response_message = f'Successfully configured remote for Sony TV at key: {oneplusip}'
+    oneplus_remote.keep_reconnecting()
 
+    response_message = "Successfully configured remote"
     return jsonify(response=response_message)
+
+
 
 @app.route('/oneplus-button-pressed', methods=['POST'])
 def oneplus_button_press():
     global oneplus_remote
-    global oneplus_ip
     data = request.get_json()
     button_class = data.get('buttonClass')
-    oneplus_remote = SendingKeySocket("OnePlus", oneplus_ip)
-    oneplus_remote.connect()
-
     if oneplus_remote:
         if button_class == 'power':
-            oneplus_remote.send_key_command(KEYCODE_POWER)
+            oneplus_remote.send_key_command("POWER")
         elif button_class == 'home':
-            oneplus_remote.send_key_command(KEYCODE_HOME)
+            oneplus_remote.send_key_command("HOME")
         elif button_class == 'back':
-            oneplus_remote.send_key_command(KEYCODE_BACK)
+            oneplus_remote.send_key_command("BACK")
         elif button_class == 'info':
-            oneplus_remote.send_key_command(KEYCODE_INFO)
+            oneplus_remote.send_key_command("INFO")
         elif button_class == 'tools':
-            oneplus_remote.send_key_command(KEYCODE_EXPLORER)
+            oneplus_remote.send_key_command("EXPLORER")
         elif button_class == 'guide':
-            oneplus_remote.send_key_command(KEYCODE_GUIDE)
+            oneplus_remote.send_key_command("GUIDE")
         elif button_class == 'menu':
-            oneplus_remote.send_key_command(KEYCODE_MENU)
+            oneplus_remote.send_key_command("MENU")
         elif button_class == 'mute':
-            oneplus_remote.send_key_command(KEYCODE_MUTE)
+            oneplus_remote.send_key_command("VOLUME_MUTE")
         elif button_class == 'volumeup':
-            oneplus_remote.send_key_command(KEYCODE_VOLUME_UP)
+            oneplus_remote.send_key_command("VOLUME_UP")
         elif button_class == 'volumedown':
-            oneplus_remote.send_key_command(KEYCODE_VOLUME_DOWN)
+            oneplus_remote.send_key_command("VOLUME_DOWN")
         elif button_class == 'channelup':
-            oneplus_remote.send_key_command(KEYCODE_CHANNEL_UP)
+            oneplus_remote.send_key_command("CHANNEL_UP")
         elif button_class == 'channeldown':
-            oneplus_remote.send_key_command(KEYCODE_CHANNEL_DOWN)
+            oneplus_remote.send_key_command("CHANNEL_DOWN")
         elif button_class == 'enter':
-            oneplus_remote.send_key_command(KEYCODE_ENTER)
+            oneplus_remote.send_key_command("ENTER")
         elif button_class == 'goup':
-            oneplus_remote.send_key_command(KEYCODE_DPAD_UP)
+            oneplus_remote.send_key_command("DPAD_UP")
         elif button_class == 'godown':
-            oneplus_remote.send_key_command(KEYCODE_DPAD_DOWN)
+            oneplus_remote.send_key_command("DPAD_DOWN")
         elif button_class == 'goleft':
-            oneplus_remote.send_key_command(KEYCODE_DPAD_LEFT)
+            oneplus_remote.send_key_command("DPAD_LEFT")
         elif button_class == 'goright':
-            oneplus_remote.send_key_command(KEYCODE_DPAD_RIGHT)
+            oneplus_remote.send_key_command("DPAD_RIGHT")
         elif button_class == 'one':
-            oneplus_remote.send_key_command(KEYCODE_1)
+            oneplus_remote.send_key_command("1")
         elif button_class == 'two':
-            oneplus_remote.send_key_command(KEYCODE_2)
+            oneplus_remote.send_key_command("2")
         elif button_class == 'three':
-            oneplus_remote.send_key_command(KEYCODE_3)
+            oneplus_remote.send_key_command("3")
         elif button_class == 'four':
-            oneplus_remote.send_key_command(KEYCODE_4)
+            oneplus_remote.send_key_command("4")
         elif button_class == 'five':
-            oneplus_remote.send_key_command(KEYCODE_5)
+            oneplus_remote.send_key_command("5")
         elif button_class == 'six':
-            oneplus_remote.send_key_command(KEYCODE_6)
+            oneplus_remote.send_key_command("6")
         elif button_class == 'seven':
-            oneplus_remote.send_key_command(KEYCODE_7)
+            oneplus_remote.send_key_command("7")
         elif button_class == 'eight':
-            oneplus_remote.send_key_command(KEYCODE_8)
+            oneplus_remote.send_key_command("8")
         elif button_class == 'nine':
-            oneplus_remote.send_key_command(KEYCODE_9)
+            oneplus_remote.send_key_command("9")
         elif button_class == 'zero':
-            oneplus_remote.send_key_command(KEYCODE_0)
+            oneplus_remote.send_key_command("0")
         elif button_class == 'f1':
-            oneplus_remote.send_key_command(KEYCODE_F1)
+            oneplus_remote.send_key_command("F1")
         elif button_class == 'f2':
-            oneplus_remote.send_key_command(KEYCODE_F2)
+            oneplus_remote.send_key_command("F2")
         elif button_class == 'f3':
-            oneplus_remote.send_key_command(KEYCODE_F3)
+            oneplus_remote.send_key_command("F3")
         elif button_class == 'f4':
-            oneplus_remote.send_key_command(KEYCODE_F4)
+            oneplus_remote.send_key_command("F4")
         elif button_class == 'netflix':
-            oneplus_remote.send_lunch_app_command("netflix")
+            oneplus_remote.send_launch_app_command("https://www.netflix.com/title")
 
         response_message = f'Successfully sent {button_class} command'
     else:
@@ -1298,99 +1503,149 @@ def oneplus_button_press():
 def sansui():
     return render_template("sansui.html")
 
+
+@app.route('/sansui-send-key', methods=['POST'])
+async def sansui_press3():
+    global sansui_remote
+    global sansui_ip
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", help="IP address of Android TV to connect to")
+    parser.add_argument(
+        "--certfile",
+        help="filename that contains the client certificate in PEM format",
+        default="cert.pem",
+    )
+    parser.add_argument(
+        "--keyfile",
+        help="filename that contains the public key in PEM format",
+        default="key.pem",
+    )
+    parser.add_argument(
+        "--client_name",
+        help="shown on the Android TV during pairing",
+        default="Android TV Remote demo",
+    )
+    parser.add_argument(
+        "--scan_timeout",
+        type=float,
+        help="zeroconf scan timeout in seconds",
+        default=10,
+    )
+    parser.add_argument(
+        "-v", "--verbose", help="enable verbose logging", action="store_true"
+    )
+    args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    host = await _host_from_zeroconf(args.scan_timeout)
+    if(host):
+        sansui_ip=host
+    else:
+        host=find_tvs("Sansui")
+        sansui_ip=host
+
+    sansui_remote = AndroidTVRemote(args.client_name, args.certfile, args.keyfile, host)
+    if await sansui_remote.async_generate_cert_if_missing():
+        await sansui_remote.async_start_pairing()
+    return "sansui-press3 response"
+
+
+
 @app.route('/sansui-send-ip', methods=['POST'])
-def sansui_press2():
+async def sansui_press2():
     global sansui_remote
     global sansui_ip
     data = request.get_json()
-    sansuiip = data.get('ip')
-    if(sansuiip=="no"):
-        sansuiip=find_tvs("Sansui")
-    sansui_ip=sansuiip
-    pairing_sock = PairingSocket("hmi", sansuiip)
-    pairing_sock.connect()
-    pairing_sock.start_pairing()
-    assert (pairing_sock.connected),"Connection unsuccessful!"
+    code = data.get('ip')
+    await _pair(sansui_remote, code)
+    while True:
+        try:
+            await sansui_remote.async_connect()
+            break
+        except InvalidAuth as exc:
+            await _pair(sansui_remote,code)
+        except (CannotConnect, ConnectionClosed) as exc:
+            _LOGGER.error("Cannot connect, exiting. Error: %s", exc)
+            return "Cannot connect, exiting. Error: " + str(exc)
 
-    response_message = f'Successfully configured remote for Sony TV at key: {sansuiip}'
+    sansui_remote.keep_reconnecting()
 
+    response_message = "Successfully configured remote"
     return jsonify(response=response_message)
 
 
 @app.route('/sansui-button-pressed', methods=['POST'])
 def sansui_button_press():
     global sansui_remote
-    global sansui_ip
     data = request.get_json()
     button_class = data.get('buttonClass')
-    sansui_remote = SendingKeySocket("Sansui", sansui_ip)
-    sansui_remote.connect()
-
     if sansui_remote:
         if button_class == 'power':
-            sansui_remote.send_key_command(KEYCODE_POWER)
+            sansui_remote.send_key_command("POWER")
         elif button_class == 'home':
-            sansui_remote.send_key_command(KEYCODE_HOME)
+            sansui_remote.send_key_command("HOME")
         elif button_class == 'back':
-            sansui_remote.send_key_command(KEYCODE_BACK)
+            sansui_remote.send_key_command("BACK")
         elif button_class == 'info':
-            sansui_remote.send_key_command(KEYCODE_INFO)
+            sansui_remote.send_key_command("INFO")
         elif button_class == 'tools':
-            sansui_remote.send_key_command(KEYCODE_EXPLORER)
+            sansui_remote.send_key_command("EXPLORER")
         elif button_class == 'guide':
-            sansui_remote.send_key_command(KEYCODE_GUIDE)
+            sansui_remote.send_key_command("GUIDE")
         elif button_class == 'menu':
-            sansui_remote.send_key_command(KEYCODE_MENU)
+            sansui_remote.send_key_command("MENU")
         elif button_class == 'mute':
-            sansui_remote.send_key_command(KEYCODE_MUTE)
+            sansui_remote.send_key_command("VOLUME_MUTE")
         elif button_class == 'volumeup':
-            sansui_remote.send_key_command(KEYCODE_VOLUME_UP)
+            sansui_remote.send_key_command("VOLUME_UP")
         elif button_class == 'volumedown':
-            sansui_remote.send_key_command(KEYCODE_VOLUME_DOWN)
+            sansui_remote.send_key_command("VOLUME_DOWN")
         elif button_class == 'channelup':
-            sansui_remote.send_key_command(KEYCODE_CHANNEL_UP)
+            sansui_remote.send_key_command("CHANNEL_UP")
         elif button_class == 'channeldown':
-            sansui_remote.send_key_command(KEYCODE_CHANNEL_DOWN)
+            sansui_remote.send_key_command("CHANNEL_DOWN")
         elif button_class == 'enter':
-            sansui_remote.send_key_command(KEYCODE_ENTER)
+            sansui_remote.send_key_command("ENTER")
         elif button_class == 'goup':
-            sansui_remote.send_key_command(KEYCODE_DPAD_UP)
+            sansui_remote.send_key_command("DPAD_UP")
         elif button_class == 'godown':
-            sansui_remote.send_key_command(KEYCODE_DPAD_DOWN)
+            sansui_remote.send_key_command("DPAD_DOWN")
         elif button_class == 'goleft':
-            sansui_remote.send_key_command(KEYCODE_DPAD_LEFT)
+            sansui_remote.send_key_command("DPAD_LEFT")
         elif button_class == 'goright':
-            sansui_remote.send_key_command(KEYCODE_DPAD_RIGHT)
+            sansui_remote.send_key_command("DPAD_RIGHT")
         elif button_class == 'one':
-            sansui_remote.send_key_command(KEYCODE_1)
+            sansui_remote.send_key_command("1")
         elif button_class == 'two':
-            sansui_remote.send_key_command(KEYCODE_2)
+            sansui_remote.send_key_command("2")
         elif button_class == 'three':
-            sansui_remote.send_key_command(KEYCODE_3)
+            sansui_remote.send_key_command("3")
         elif button_class == 'four':
-            sansui_remote.send_key_command(KEYCODE_4)
+            sansui_remote.send_key_command("4")
         elif button_class == 'five':
-            sansui_remote.send_key_command(KEYCODE_5)
+            sansui_remote.send_key_command("5")
         elif button_class == 'six':
-            sansui_remote.send_key_command(KEYCODE_6)
+            sansui_remote.send_key_command("6")
         elif button_class == 'seven':
-            sansui_remote.send_key_command(KEYCODE_7)
+            sansui_remote.send_key_command("7")
         elif button_class == 'eight':
-            sansui_remote.send_key_command(KEYCODE_8)
+            sansui_remote.send_key_command("8")
         elif button_class == 'nine':
-            sansui_remote.send_key_command(KEYCODE_9)
+            sansui_remote.send_key_command("9")
         elif button_class == 'zero':
-            sansui_remote.send_key_command(KEYCODE_0)
+            sansui_remote.send_key_command("0")
         elif button_class == 'f1':
-            sansui_remote.send_key_command(KEYCODE_F1)
+            sansui_remote.send_key_command("F1")
         elif button_class == 'f2':
-            sansui_remote.send_key_command(KEYCODE_F2)
+            sansui_remote.send_key_command("F2")
         elif button_class == 'f3':
-            sansui_remote.send_key_command(KEYCODE_F3)
+            sansui_remote.send_key_command("F3")
         elif button_class == 'f4':
-            sansui_remote.send_key_command(KEYCODE_F4)
+            sansui_remote.send_key_command("F4")
         elif button_class == 'netflix':
-            sansui_remote.send_lunch_app_command("netflix")
+            sansui_remote.send_launch_app_command("https://www.netflix.com/title")
 
         response_message = f'Successfully sent {button_class} command'
     else:
@@ -1404,99 +1659,150 @@ def sansui_button_press():
 def toshiba():
     return render_template("toshiba.html")
 
+@app.route('/toshiba-send-key', methods=['POST'])
+async def toshiba_press3():
+    global toshiba_remote
+    global toshiba_ip
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", help="IP address of Android TV to connect to")
+    parser.add_argument(
+        "--certfile",
+        help="filename that contains the client certificate in PEM format",
+        default="cert.pem",
+    )
+    parser.add_argument(
+        "--keyfile",
+        help="filename that contains the public key in PEM format",
+        default="key.pem",
+    )
+    parser.add_argument(
+        "--client_name",
+        help="shown on the Android TV during pairing",
+        default="Android TV Remote demo",
+    )
+    parser.add_argument(
+        "--scan_timeout",
+        type=float,
+        help="zeroconf scan timeout in seconds",
+        default=10,
+    )
+    parser.add_argument(
+        "-v", "--verbose", help="enable verbose logging", action="store_true"
+    )
+    args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    host = await _host_from_zeroconf(args.scan_timeout)
+    if(host):
+        toshiba_ip=host
+    else:
+        host=find_tvs("Toshiba")
+        toshiba_ip=host
+
+    toshiba_remote = AndroidTVRemote(args.client_name, args.certfile, args.keyfile, host)
+    if await toshiba_remote.async_generate_cert_if_missing():
+        await toshiba_remote.async_start_pairing()
+    return "toshiba-press3 response"
+
+
+
 @app.route('/toshiba-send-ip', methods=['POST'])
-def toshiba_press2():
+async def toshiba_press2():
     global toshiba_remote
     global toshiba_ip
     data = request.get_json()
-    toshibaip = data.get('ip')
-    if(toshibaip=="no"):
-        toshibaip=find_tvs("TOSHIBA")
-    toshiba_ip=toshibaip
-    pairing_sock = PairingSocket("hmi", toshibaip)
-    pairing_sock.connect()
-    pairing_sock.start_pairing()
-    assert (pairing_sock.connected),"Connection unsuccessful!"
+    code = data.get('ip')
+    await _pair(toshiba_remote, code)
+    while True:
+        try:
+            await toshiba_remote.async_connect()
+            break
+        except InvalidAuth as exc:
+            await _pair(toshiba_remote,code)
+        except (CannotConnect, ConnectionClosed) as exc:
+            _LOGGER.error("Cannot connect, exiting. Error: %s", exc)
+            return "Cannot connect, exiting. Error: " + str(exc)
 
-    response_message = f'Successfully configured remote for Sony TV at key: {toshibaip}'
+    toshiba_remote.keep_reconnecting()
 
+    response_message = "Successfully configured remote"
     return jsonify(response=response_message)
+
+
 
 
 @app.route('/toshiba-button-pressed', methods=['POST'])
 def toshiba_button_press():
     global toshiba_remote
-    global toshiba_ip
     data = request.get_json()
     button_class = data.get('buttonClass')
-    toshiba_remote = SendingKeySocket("TOSHIBA", toshiba_ip)
-    toshiba_remote.connect()
-
     if toshiba_remote:
         if button_class == 'power':
-            toshiba_remote.send_key_command(KEYCODE_POWER)
+            toshiba_remote.send_key_command("POWER")
         elif button_class == 'home':
-            toshiba_remote.send_key_command(KEYCODE_HOME)
+            toshiba_remote.send_key_command("HOME")
         elif button_class == 'back':
-            toshiba_remote.send_key_command(KEYCODE_BACK)
+            toshiba_remote.send_key_command("BACK")
         elif button_class == 'info':
-            toshiba_remote.send_key_command(KEYCODE_INFO)
+            toshiba_remote.send_key_command("INFO")
         elif button_class == 'tools':
-            toshiba_remote.send_key_command(KEYCODE_EXPLORER)
+            toshiba_remote.send_key_command("EXPLORER")
         elif button_class == 'guide':
-            toshiba_remote.send_key_command(KEYCODE_GUIDE)
+            toshiba_remote.send_key_command("GUIDE")
         elif button_class == 'menu':
-            toshiba_remote.send_key_command(KEYCODE_MENU)
+            toshiba_remote.send_key_command("MENU")
         elif button_class == 'mute':
-            toshiba_remote.send_key_command(KEYCODE_MUTE)
+            toshiba_remote.send_key_command("VOLUME_MUTE")
         elif button_class == 'volumeup':
-            toshiba_remote.send_key_command(KEYCODE_VOLUME_UP)
+            toshiba_remote.send_key_command("VOLUME_UP")
         elif button_class == 'volumedown':
-            toshiba_remote.send_key_command(KEYCODE_VOLUME_DOWN)
+            toshiba_remote.send_key_command("VOLUME_DOWN")
         elif button_class == 'channelup':
-            toshiba_remote.send_key_command(KEYCODE_CHANNEL_UP)
+            toshiba_remote.send_key_command("CHANNEL_UP")
         elif button_class == 'channeldown':
-            toshiba_remote.send_key_command(KEYCODE_CHANNEL_DOWN)
+            toshiba_remote.send_key_command("CHANNEL_DOWN")
         elif button_class == 'enter':
-            toshiba_remote.send_key_command(KEYCODE_ENTER)
+            toshiba_remote.send_key_command("ENTER")
         elif button_class == 'goup':
-            toshiba_remote.send_key_command(KEYCODE_DPAD_UP)
+            toshiba_remote.send_key_command("DPAD_UP")
         elif button_class == 'godown':
-            toshiba_remote.send_key_command(KEYCODE_DPAD_DOWN)
+            toshiba_remote.send_key_command("DPAD_DOWN")
         elif button_class == 'goleft':
-            toshiba_remote.send_key_command(KEYCODE_DPAD_LEFT)
+            toshiba_remote.send_key_command("DPAD_LEFT")
         elif button_class == 'goright':
-            toshiba_remote.send_key_command(KEYCODE_DPAD_RIGHT)
+            toshiba_remote.send_key_command("DPAD_RIGHT")
         elif button_class == 'one':
-            toshiba_remote.send_key_command(KEYCODE_1)
+            toshiba_remote.send_key_command("1")
         elif button_class == 'two':
-            toshiba_remote.send_key_command(KEYCODE_2)
+            toshiba_remote.send_key_command("2")
         elif button_class == 'three':
-            toshiba_remote.send_key_command(KEYCODE_3)
+            toshiba_remote.send_key_command("3")
         elif button_class == 'four':
-            toshiba_remote.send_key_command(KEYCODE_4)
+            toshiba_remote.send_key_command("4")
         elif button_class == 'five':
-            toshiba_remote.send_key_command(KEYCODE_5)
+            toshiba_remote.send_key_command("5")
         elif button_class == 'six':
-            toshiba_remote.send_key_command(KEYCODE_6)
+            toshiba_remote.send_key_command("6")
         elif button_class == 'seven':
-            toshiba_remote.send_key_command(KEYCODE_7)
+            toshiba_remote.send_key_command("7")
         elif button_class == 'eight':
-            toshiba_remote.send_key_command(KEYCODE_8)
+            toshiba_remote.send_key_command("8")
         elif button_class == 'nine':
-            toshiba_remote.send_key_command(KEYCODE_9)
+            toshiba_remote.send_key_command("9")
         elif button_class == 'zero':
-            toshiba_remote.send_key_command(KEYCODE_0)
+            toshiba_remote.send_key_command("0")
         elif button_class == 'f1':
-            toshiba_remote.send_key_command(KEYCODE_F1)
+            toshiba_remote.send_key_command("F1")
         elif button_class == 'f2':
-            toshiba_remote.send_key_command(KEYCODE_F2)
+            toshiba_remote.send_key_command("F2")
         elif button_class == 'f3':
-            toshiba_remote.send_key_command(KEYCODE_F3)
+            toshiba_remote.send_key_command("F3")
         elif button_class == 'f4':
-            toshiba_remote.send_key_command(KEYCODE_F4)
+            toshiba_remote.send_key_command("F4")
         elif button_class == 'netflix':
-            toshiba_remote.send_lunch_app_command("netflix")
+            toshiba_remote.send_launch_app_command("https://www.netflix.com/title")
 
         response_message = f'Successfully sent {button_class} command'
     else:
