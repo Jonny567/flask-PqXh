@@ -186,12 +186,13 @@
         <div class="col-md-6">
             <div class="card">
                 <div class="card-body">
-                    <h1 class="text-center">Sansui - Android</h1>
+                    <h1 class="text-center">Sansui TV</h1>
                     <form method="POST" action="/send-command">
-                        <button type="button" class="btn btn-primary btn-block" id="connect-button2">Auto Connect</button>
-                        <div style="text-align: center;">OR</div>
+                        <button type="button" class="btn btn-primary btn-block" id="connect-button2">Send Key</button>
+                    </form>
+                    <form method="POST" action="/send-command">
                         <div class="form-group">
-                            <label for="manual_device">Enter TV IP</label>
+                            <label for="manual_device">Enter Pairing Key:</label>
                             <input type="text" class="form-control" name="manual_device" id="manual_device">
                         </div>
                         <button type="button" class="btn btn-primary btn-block" id="connect-button">Connect</button>
@@ -568,7 +569,7 @@
         // Show the loader while making the request
         loader.style.display = 'block';
 
-        fetch('/sansui-send-ip', {
+        fetch('/sansui-send-key', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
